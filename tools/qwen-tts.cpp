@@ -12,6 +12,7 @@
 // (resolved inside qt_synthesize), the utterance text is read from stdin.
 
 #include "audio-io.h"
+#include "backend.h"
 #include "qwen.h"
 #include "rvq-file.h"
 #include "sampling-defaults.h"
@@ -42,6 +43,8 @@ static void print_usage(const char * prog) {
             "  stdin                   Target text to synthesise. Read fully then synthesised in one\n"
             "                          shot, or line by line with --stream-by-line.\n\n"
             "Optional:\n"
+            "  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...\n"
+            "                          (default: best available)\n"
             "  --format <fmt>          WAV output format: wav16, wav24, wav32 (default: wav16)\n"
             "  --lang <name>           Language label (default: auto)\n"
             "  --instruct <str>        Style instruction. Required for VoiceDesign, optional for\n"
@@ -87,6 +90,7 @@ struct Args {
     const char * ref_text_path;
     const char * out_wav;
     const char * format;
+    const char * device;
     bool         use_fa;
     bool         clamp_fp16;
     bool         stream_by_line;
@@ -189,6 +193,8 @@ static bool parse_args(int argc, char ** argv, Args & a) {
             a.model = argv[++i];
         } else if (std::strcmp(arg, "--codec") == 0 && i + 1 < argc) {
             a.codec = argv[++i];
+        } else if (std::strcmp(arg, "--device") == 0 && i + 1 < argc) {
+            a.device = argv[++i];
         } else if (std::strcmp(arg, "--lang") == 0 && i + 1 < argc) {
             a.lang = argv[++i];
         } else if (std::strcmp(arg, "--instruct") == 0 && i + 1 < argc) {
@@ -246,7 +252,7 @@ static bool parse_args(int argc, char ** argv, Args & a) {
             return false;
         }
     }
-    return a.model && a.codec;
+    return a.model && a.codec && (!a.device || backend_check_device(a.device));
 }
 
 static int run(const Args & a) {
@@ -261,6 +267,7 @@ static int run(const Args & a) {
     iparams.use_fa          = a.use_fa;
     iparams.clamp_fp16      = a.clamp_fp16;
     iparams.codec_chunk_sec = a.codec_chunk_sec;
+    iparams.device          = a.device;
 
     qt_context * q = qt_init(&iparams);
     if (!q) {

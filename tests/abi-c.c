@@ -81,8 +81,8 @@ int main(void) {
         fprintf(stderr, "[Probe] abi_version not set by qt_*_default_params\n");
         return 1;
     }
-    if (!iparams.use_fa || iparams.clamp_fp16) {
-        fprintf(stderr, "[Probe] init_params defaults do not match (use_fa=true, clamp_fp16=false)\n");
+    if (!iparams.use_fa || iparams.clamp_fp16 || iparams.device) {
+        fprintf(stderr, "[Probe] init_params defaults do not match (use_fa=true, clamp_fp16=false, device=NULL)\n");
         return 1;
     }
 

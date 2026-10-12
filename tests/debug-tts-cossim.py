@@ -42,6 +42,8 @@ def main():
     ap.add_argument("--lang",           default="english")
     ap.add_argument("--quant",          default="F32",
                     help="GGUF quantization suffix (F32, BF16, Q8_0, Q4_K_M)")
+    ap.add_argument("--device",         default=None,
+                    help="GGML device passed to qwen-tts (default: best available)")
     ap.add_argument("--out-pt",         default=os.path.join(DUMP_PT,  "tts-python.wav"))
     ap.add_argument("--out-cpp",        default=os.path.join(DUMP_CPP, "tts-cpp.wav"))
     ap.add_argument("--max-new-tokens", type=int, default=64)
@@ -148,6 +150,8 @@ def main():
         "-o",         args.out_cpp,
         "--greedy",
     ]
+    if args.device:
+        cmd += ["--device", args.device]
     print(f"[GGML] Cmd: {' '.join(cmd)}")
     r = subprocess.run(cmd, input=text, text=True)
     if r.returncode != 0:

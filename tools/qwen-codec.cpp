@@ -41,6 +41,8 @@ static void print_usage(const char * prog) {
             "Required:\n"
             "  --model <gguf>          Codec GGUF (qwen-tokenizer-12hz-*.gguf)\n\n"
             "Optional:\n"
+            "  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...\n"
+            "                          (default: best available)\n"
             "  -i <path>               Input. WAV -> encode, .rvq -> decode\n"
             "  --talker <gguf>         Talker GGUF (Base only). Encode also extracts the speaker\n"
             "                          embedding and writes it next to the .rvq as a .spk file\n"
@@ -138,11 +140,14 @@ int main(int argc, char ** argv) {
     const char * model_path  = NULL;
     const char * input_path  = NULL;
     const char * talker_path = NULL;
+    const char * device      = NULL;
     WavFormat    wav_fmt     = WAV_S16;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
             model_path = argv[++i];
+        } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            device = argv[++i];
         } else if (strcmp(argv[i], "--talker") == 0 && i + 1 < argc) {
             talker_path = argv[++i];
         } else if (strcmp(argv[i], "-i") == 0 && i + 1 < argc) {
@@ -163,6 +168,10 @@ int main(int argc, char ** argv) {
         print_usage(argv[0]);
         return 1;
     }
+    if (device && !backend_check_device(device)) {
+        print_usage(argv[0]);
+        return 1;
+    }
 
     int mode = 0;
     if (input_path) {
@@ -173,7 +182,7 @@ int main(int argc, char ** argv) {
         }
     }
 
-    BackendPair bp = backend_init("Codec");
+    BackendPair bp = backend_init("Codec", device);
     if (!bp.backend) {
         fprintf(stderr, "[Codec] FATAL: backend init failed\n");
         return 1;

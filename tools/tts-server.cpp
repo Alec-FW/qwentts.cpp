@@ -5,6 +5,7 @@
 
 #include "tts-server.h"
 
+#include "backend.h"
 #include "qwen.h"
 #include "rvq-file.h"
 #include "version.h"
@@ -46,6 +47,8 @@ static void print_usage(const char * prog) {
             "  --model <gguf>          Talker LM GGUF (qwen-talker-*.gguf)\n"
             "  --codec <gguf>          Codec GGUF (qwen-tokenizer-*.gguf)\n\n"
             "Optional:\n"
+            "  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...\n"
+            "                          (default: best available)\n"
             "  --alias <name>          Report this model id instead of the GGUF file name\n"
             "  --host <ip>             Listen address (default: 127.0.0.1)\n"
             "  --port <n>              Listen port (default: 8080)\n"
@@ -67,6 +70,7 @@ static std::string basename_of(const char * path) {
 int main(int argc, char ** argv) {
     const char *  talker_path = NULL;
     const char *  codec_path  = NULL;
+    const char *  device      = NULL;
     std::string   model_alias;
     std::string   lang = "auto";
     server_config cfg;
@@ -83,6 +87,8 @@ int main(int argc, char ** argv) {
             talker_path = argv[++i];
         } else if (!std::strcmp(arg, "--codec") && i + 1 < argc) {
             codec_path = argv[++i];
+        } else if (!std::strcmp(arg, "--device") && i + 1 < argc) {
+            device = argv[++i];
         } else if (!std::strcmp(arg, "--alias") && i + 1 < argc) {
             model_alias = argv[++i];
         } else if (!std::strcmp(arg, "--host") && i + 1 < argc) {
@@ -109,6 +115,10 @@ int main(int argc, char ** argv) {
         print_usage(argv[0]);
         return 1;
     }
+    if (device && !backend_check_device(device)) {
+        print_usage(argv[0]);
+        return 1;
+    }
 
     struct qt_init_params iparams;
     qt_init_default_params(&iparams);
@@ -118,6 +128,7 @@ int main(int argc, char ** argv) {
     iparams.clamp_fp16      = clamp_fp16;
     iparams.max_batch       = max_batch;
     iparams.codec_chunk_sec = codec_chunk_dur;
+    iparams.device          = device;
 
     struct qt_context * q = qt_init(&iparams);
     if (!q) {
