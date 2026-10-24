@@ -52,9 +52,9 @@ static void print_usage(const char * prog) {
             "  --speaker <name>        Speaker name (CustomVoice only)\n"
             "  --ref-wav <path>        Reference WAV for voice cloning (Base only)\n"
             "  --ref-spk <path>        Pre-extracted speaker embedding from qwen-codec --talker\n"
-            "                          (replaces --ref-wav, Base only)\n"
+            "                          (replaces --ref-wav; Base and CustomVoice)\n"
             "  --ref-rvq <path>        Pre-encoded reference codes from qwen-codec (requires\n"
-            "                          --ref-spk and --ref-text, enables ICL clone mode)\n"
+            "                          --ref-spk; with --ref-text enables ICL, otherwise ignored)\n"
             "  --ref-text <path>       Transcript file for the reference (enables ICL clone mode)\n"
             "  --max-new <n>           Max new audio frames (default: %d)\n"
             "  --codec-chunk-dur <f>   Codec decode chunk duration in seconds (default: 24.0)\n"
@@ -336,6 +336,15 @@ static int run(const Args & a) {
             return 1;
         }
         fprintf(stderr, "[CLI] Reference RVQ: %s, K=%d T=%d\n", a.ref_rvq, K, ref_T);
+        // Mirror the server's registered-voice policy: the rvq only drives
+        // ICL, so without a transcript the caller still gets x-vector-only
+        // cloning instead of an admission error. Keep the pair invalid when
+        // no speaker embedding was supplied.
+        if ((!ref_text || ref_text[0] == '\0') && !ref_spk_emb.empty()) {
+            fprintf(stderr, "[CLI] Reference RVQ without reference text: ICL disabled, using x-vector only\n");
+            ref_codes.clear();
+            ref_T = 0;
+        }
     }
 
     // Resolve output WAV format string: wav16 / wav24 / wav32. Default
@@ -499,6 +508,7 @@ static int run(const Args & a) {
 }
 
 int main(int argc, char ** argv) {
+    utf8_init(&argc, &argv);
     Args a;
     if (!parse_args(argc, argv, a)) {
         print_usage(argv[0]);

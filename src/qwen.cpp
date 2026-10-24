@@ -653,6 +653,8 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
     // gets a silently wrong synthesis. Messages preserved verbatim
     // from the previous CLI-side checks.
     const std::string & mt = q->pt.model_type;
+    const bool          has_lat_spk   = params->ref_spk_emb && params->ref_spk_dim > 0;
+    const bool          has_lat_codes = params->ref_codes && params->ref_T > 0;
     if (params->speaker && mt != "custom_voice") {
         qt_set_error("--speaker is only valid for custom_voice models (loaded: %s)", mt.c_str());
         if (out) {
@@ -667,8 +669,8 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
         }
         return QT_STATUS_MODE_INVALID;
     }
-    if (mt == "custom_voice" && !params->speaker) {
-        qt_set_error("custom_voice models require --speaker");
+    if (mt == "custom_voice" && !params->speaker && !has_lat_spk) {
+        qt_set_error("custom_voice models require --speaker or --ref-spk");
         if (out) {
             qt_audio_free(out);
         }
@@ -681,11 +683,17 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
         }
         return QT_STATUS_MODE_INVALID;
     }
-    const bool has_lat_spk   = params->ref_spk_emb && params->ref_spk_dim > 0;
-    const bool has_lat_codes = params->ref_codes && params->ref_T > 0;
 
-    if ((params->ref_audio_24k || has_lat_spk) && mt != "base") {
-        qt_set_error("--ref-wav / --ref-spk is only valid for base models (loaded: %s)", mt.c_str());
+    if ((params->ref_audio_24k || has_lat_spk) && mt != "base" && mt != "custom_voice") {
+        qt_set_error("--ref-wav / --ref-spk is only valid for base and custom_voice models (loaded: %s)", mt.c_str());
+        if (out) {
+            qt_audio_free(out);
+        }
+        return QT_STATUS_MODE_INVALID;
+    }
+    if (params->ref_audio_24k && mt == "custom_voice") {
+        qt_set_error("--ref-wav is not valid for custom_voice models (no speaker encoder); run "
+                     "qwen-codec --talker <base gguf> on the clip and pass --ref-spk");
         if (out) {
             qt_audio_free(out);
         }
@@ -697,6 +705,14 @@ enum qt_status qt_synthesize(struct qt_context * q, const struct qt_tts_params *
             qt_audio_free(out);
         }
         return QT_STATUS_INVALID_PARAMS;
+    }
+    if ((has_lat_codes || params->ref_text) && mt != "base" && mt != "custom_voice") {
+        qt_set_error("--ref-rvq / --ref-text ICL mode is only valid for base and custom_voice models (loaded: %s)",
+                     mt.c_str());
+        if (out) {
+            qt_audio_free(out);
+        }
+        return QT_STATUS_MODE_INVALID;
     }
     if (params->ref_text && !params->ref_audio_24k && !has_lat_codes) {
         qt_set_error("--ref-text requires --ref-wav or --ref-rvq");

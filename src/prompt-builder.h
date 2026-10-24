@@ -1,4 +1,8 @@
 #pragma once
+
+#include <cstdlib>
+#include <cstring>
+
 // prompt-builder.h: assemble the talker prefix input embedding from
 // a tokenized text plus a language tag, mirroring the upstream
 // generate() function of Qwen3-TTS.
@@ -80,6 +84,56 @@ struct PromptBuilderOutput {
     // Length of the text segment used as utterance text, ie input_id[3:-5].
     int N_text;
 };
+
+static void embed_row_to_f32(const GGUFModel & gf, const char * tensor_name, int row_id, int dim, float * dst);
+
+// CustomVoice graft calibration. The named-speaker rows of the
+// custom_voice checkpoints sit at a characteristic norm (13.9..15.1 on
+// 1.7B) while an ECAPA x-vector from a reference clip is ~17.3. Raw
+// injection is off-distribution there, so rescale the clone vector to
+// the mean norm of the model's own speaker rows. QWEN_GRAFT_SPK_SCALE
+// multiplies the automatic scale, or "off"/"0" disables it (A/B knob).
+static float graft_speaker_norm_scale(const PipelineTTS * pt, const float * emb, int hidden) {
+    double n2 = 0.0;
+    for (int i = 0; i < hidden; i++) {
+        n2 += (double) emb[i] * (double) emb[i];
+    }
+    const float norm = (float) std::sqrt(n2);
+    if (!(norm > 1e-6f) || pt->speakers.empty()) {
+        return 1.0f;
+    }
+    std::vector<float> row((size_t) hidden);
+    double             sum = 0.0;
+    int                n   = 0;
+    for (const SpeakerEntry & s : pt->speakers) {
+        try {
+            embed_row_to_f32(pt->gguf_talker, "talker.codec_embd.weight", s.id, hidden, row.data());
+        } catch (...) {
+            continue;
+        }
+        double r2 = 0.0;
+        for (int i = 0; i < hidden; i++) {
+            r2 += (double) row[i] * (double) row[i];
+        }
+        sum += std::sqrt(r2);
+        n++;
+    }
+    if (n == 0) {
+        return 1.0f;
+    }
+    float scale = (float) (sum / (double) n) / norm;
+    const char * env = std::getenv("QWEN_GRAFT_SPK_SCALE");
+    if (env && env[0]) {
+        if (std::strcmp(env, "off") == 0 || std::strcmp(env, "0") == 0) {
+            return 1.0f;
+        }
+        const float m = (float) std::atof(env);
+        if (m > 0.0f) {
+            scale *= m;
+        }
+    }
+    return scale;
+}
 
 // Convert one row of an embedding matrix W [vocab, dim] to f32. Uses the
 // ggml type traits to_float dispatch so every dtype shipped by the
@@ -629,7 +683,16 @@ static bool prompt_builder_build(PipelineTTS *         pt,
             // user supplied ref_spk_emb (voice clone mode A).
             std::vector<float> ce((size_t) hidden);
             if (codec_left[(size_t) i] == -2) {
-                std::memcpy(ce.data(), ref_spk_emb, (size_t) hidden * sizeof(float));
+                if (pt->model_type == "custom_voice") {
+                    const float scale = graft_speaker_norm_scale(pt, ref_spk_emb, hidden);
+                    for (int j = 0; j < hidden; j++) {
+                        ce[(size_t) j] = ref_spk_emb[j] * scale;
+                    }
+                    qt_log(QT_LOG_INFO, "[Prompt] Graft speaker embedding scaled by %.4f to the named-speaker norm",
+                           (double) scale);
+                } else {
+                    std::memcpy(ce.data(), ref_spk_emb, (size_t) hidden * sizeof(float));
+                }
             } else {
                 embed_row_to_f32(pt->gguf_talker, "talker.codec_embd.weight", codec_left[(size_t) i], hidden,
                                  ce.data());

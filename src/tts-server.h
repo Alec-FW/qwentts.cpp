@@ -441,8 +441,10 @@ static bool tts_b64_decode(const std::string & in, std::string & out) {
     return true;
 }
 
-// Parse the POST /v1/audio/voices body: name plus either wav_b64 or the
-// spk_b64 / rvq_b64 pair, ref_text optional (enables ICL clone mode).
+// Parse the POST /v1/audio/voices body: name plus either wav_b64 or
+// spk_b64 (x-vector only) with an optional rvq_b64 + ref_text pair for
+// ICL clone mode. CustomVoice models accept spk_b64 (plus optional
+// rvq/ref_text); wav_b64 is rejected there because they have no encoder.
 static bool tts_parse_voice_upload(const std::string & body, tts_voice_upload & up, std::string & err) {
     yyjson_doc * doc = yyjson_read(body.c_str(), body.size(), 0);
     if (!doc) {
@@ -465,7 +467,16 @@ static bool tts_parse_voice_upload(const std::string & body, tts_voice_upload & 
     up.name = tts_voice_name(yyjson_get_str(name));
 
     yyjson_val * ref_text = yyjson_obj_get(root, "ref_text");
-    up.ref_text           = yyjson_is_str(ref_text) ? yyjson_get_str(ref_text) : "";
+    if (yyjson_is_str(ref_text)) {
+        // Match the CLI's file loader: strip surrounding whitespace so a
+        // trailing newline cannot change the ICL tokenization.
+        std::string t = yyjson_get_str(ref_text);
+        const size_t a = t.find_first_not_of(" \t\r\n");
+        const size_t b = t.find_last_not_of(" \t\r\n");
+        up.ref_text = (a == std::string::npos) ? "" : t.substr(a, b - a + 1);
+    } else {
+        up.ref_text = "";
+    }
 
     yyjson_val * wav = yyjson_obj_get(root, "wav_b64");
     yyjson_val * spk = yyjson_obj_get(root, "spk_b64");
@@ -475,9 +486,18 @@ static bool tts_parse_voice_upload(const std::string & body, tts_voice_upload & 
     const bool has_spk = yyjson_is_str(spk) && yyjson_get_len(spk) > 0;
     const bool has_rvq = yyjson_is_str(rvq) && yyjson_get_len(rvq) > 0;
 
-    const bool has_latents = has_spk && has_rvq;
-    if (has_spk != has_rvq || has_wav == has_latents) {
-        err = "provide either 'wav_b64' or both 'spk_b64' and 'rvq_b64'";
+    if (has_wav && has_spk) {
+        err = "provide either 'wav_b64' or 'spk_b64' (+ optional 'rvq_b64'), not both";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    if (!has_wav && !has_spk) {
+        err = "provide 'wav_b64' or 'spk_b64' (+ optional 'rvq_b64')";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    if (has_rvq && !has_spk) {
+        err = "'rvq_b64' requires 'spk_b64'";
         yyjson_doc_free(doc);
         return false;
     }

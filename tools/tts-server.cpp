@@ -146,13 +146,30 @@ int main(int argc, char ** argv) {
     // Voice registry: POST /v1/audio/voices stores a cloned voice either from a
     // WAV (server side extraction through qt_extract_voice_ref) or from
     // pre-extracted .spk / .rvq payloads. Re-registering a name replaces
-    // the previous entry. Only base models synthesize from a voice
-    // reference, so both payloads are refused on any other model type.
+    // the previous entry. Base models accept WAV + ICL latents; custom_voice
+    // accepts a pre-extracted x-vector (plus optional rvq/ref_text for ICL),
+    // since custom_voice GGUFs carry no speaker encoder for WAV extraction.
     be.register_voice = [q](const tts_voice_upload & up, std::string & err) -> bool {
-        const std::string mt = qt_model_type(q);
-        if (mt != "base") {
-            err = "voice registration is only valid for base models (loaded: " + mt + ")";
+        const std::string mt    = qt_model_type(q);
+        const bool        graft = (mt == "custom_voice");
+        if (mt != "base" && !graft) {
+            err = "voice registration is only valid for base and custom_voice models (loaded: " + mt + ")";
             return false;
+        }
+        if (up.wav.empty() && !up.ref_text.empty() && up.rvq.empty()) {
+            err = "'ref_text' requires 'rvq_b64' when no 'wav_b64' is supplied";
+            return false;
+        }
+        if (graft) {
+            if (!up.wav.empty()) {
+                err = "custom_voice registration needs spk_b64; extract it offline with "
+                      "qwen-codec --talker <base gguf> and POST the raw embedding";
+                return false;
+            }
+            if (up.spk.empty()) {
+                err = "custom_voice registration requires spk_b64";
+                return false;
+            }
         }
 
         voice_entry entry;
@@ -177,20 +194,22 @@ int main(int argc, char ** argv) {
                 err = "'spk_b64' must decode to a positive multiple of 4 bytes";
                 return false;
             }
-            std::vector<int32_t> codes;
-            int                  ref_T = 0;
-            const int            K     = qt_num_codebooks(q);
-            if (!rvq_read_buf((const uint8_t *) up.rvq.data(), up.rvq.size(), K, RVQ_CODE_BITS, codes, &ref_T)) {
-                err = "'rvq_b64' does not decode to a valid packed code stream";
-                return false;
-            }
             entry.ref.ref_spk_dim = (int) (up.spk.size() / sizeof(float));
             entry.ref.ref_spk_emb = (float *) malloc(up.spk.size());
             std::memcpy(entry.ref.ref_spk_emb, up.spk.data(), up.spk.size());
-            entry.ref.ref_T         = ref_T;
-            entry.ref.num_codebooks = K;
-            entry.ref.ref_codes     = (int32_t *) malloc(codes.size() * sizeof(int32_t));
-            std::memcpy(entry.ref.ref_codes, codes.data(), codes.size() * sizeof(int32_t));
+            if (!up.rvq.empty()) {
+                std::vector<int32_t> codes;
+                int                  ref_T = 0;
+                const int            K     = qt_num_codebooks(q);
+                if (!rvq_read_buf((const uint8_t *) up.rvq.data(), up.rvq.size(), K, RVQ_CODE_BITS, codes, &ref_T)) {
+                    err = "'rvq_b64' does not decode to a valid packed code stream";
+                    return false;
+                }
+                entry.ref.ref_T         = ref_T;
+                entry.ref.num_codebooks = K;
+                entry.ref.ref_codes     = (int32_t *) malloc(codes.size() * sizeof(int32_t));
+                std::memcpy(entry.ref.ref_codes, codes.data(), codes.size() * sizeof(int32_t));
+            }
         }
 
         std::lock_guard<std::mutex> lock(g_voices_mutex);
