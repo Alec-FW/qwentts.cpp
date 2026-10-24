@@ -620,7 +620,14 @@ static bool prompt_builder_build(PipelineTTS *         pt,
     // branch upstream pads the shorter stream so they end up the same
     // length, except when text > codec where trailing_text_hidden carries
     // the leftover text rows.
-    const int text_lens_icl  = icl ? (N_ref_text + N_text + 1) : 0;
+    //
+    // QWEN_ICL_SEAM_PAD=1 inserts one tts_pad row between the reference
+    // body and the target body. The default alignment puts the first
+    // target token on the ref/target seam, where it is consumed and never
+    // spoken; the pad shifts the target one row later. Off by default.
+    const char * seam_env = std::getenv("QWEN_ICL_SEAM_PAD");
+    const int    seam_pad = (icl && seam_env && seam_env[0] && seam_env[0] != '0') ? 1 : 0;
+    const int    text_lens_icl  = icl ? (N_ref_text + seam_pad + N_text + 1) : 0;
     const int codec_lens_icl = icl ? (1 + ref_codes_T) : 0;
     const int icl_T          = icl ? (text_lens_icl > codec_lens_icl ? codec_lens_icl : codec_lens_icl) : 0;
 
@@ -752,15 +759,24 @@ static bool prompt_builder_build(PipelineTTS *         pt,
         // bodies are contiguous, projected in one backend pass.
         std::vector<float> text_stream((size_t) text_lens_icl * (size_t) hidden, 0.0f);
         {
-            std::vector<int32_t> text_ids;
-            text_ids.reserve((size_t) N_ref_text + (size_t) N_text);
+            std::vector<int32_t> ref_body;
+            ref_body.reserve((size_t) N_ref_text);
             for (int i = 0; i < N_ref_text; i++) {
-                text_ids.push_back((int32_t) ref_ids[3 + i]);
+                ref_body.push_back((int32_t) ref_ids[3 + i]);
             }
+            std::vector<int32_t> tgt_body;
+            tgt_body.reserve((size_t) N_text);
             for (int i = 0; i < N_text; i++) {
-                text_ids.push_back((int32_t) ids[3 + i]);
+                tgt_body.push_back((int32_t) ids[3 + i]);
             }
-            project_text_ids(pt, text_ids, text_stream.data());
+            project_text_ids(pt, ref_body, text_stream.data());
+            if (seam_pad) {
+                std::memcpy(text_stream.data() + (size_t) N_ref_text * (size_t) hidden, tts_pad_emb.data(),
+                            (size_t) hidden * sizeof(float));
+                qt_log(QT_LOG_INFO, "[Prompt] ICL seam pad between ref_text and target text");
+            }
+            project_text_ids(pt, tgt_body,
+                             text_stream.data() + (size_t) (N_ref_text + seam_pad) * (size_t) hidden);
         }
         // Append tts_eos at the end of the text stream.
         std::memcpy(text_stream.data() + (size_t) (text_lens_icl - 1) * (size_t) hidden, tts_eos_emb.data(),
