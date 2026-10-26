@@ -10,6 +10,7 @@
 #include "rvq-file.h"
 #include "version.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -245,6 +246,8 @@ int main(int argc, char ** argv) {
         return names;
     };
 
+    const bool base_model = std::string(qt_model_type(q)) == "base";
+
     // pcm drives the streaming pipeline : on_chunk routes each decoded
     // frame to the shared sink for lowest latency. wav leaves on_chunk
     // unset so the pipeline runs the buffered chunked codec path (batch
@@ -253,7 +256,8 @@ int main(int argc, char ** argv) {
     // the same name and injects the pre-extracted reference latents. A
     // name matching neither is rejected instead of silently generating
     // voiceless.
-    be.synthesize = [q, &lang](const tts_request & req, const tts_sink & sink, std::string & err) -> int {
+    be.synthesize = [q, &lang, base_model](const tts_request & req, const tts_sink & sink,
+                                           std::string & err) -> int {
         struct qt_tts_params p;
         qt_tts_default_params(&p);
         p.text = req.input.c_str();
@@ -296,8 +300,18 @@ int main(int argc, char ** argv) {
             err = "unknown voice '" + req.voice + "'";
             return (int) QT_STATUS_INVALID_PARAMS;
         }
+        // Base has no instruct support. Drop it at the server boundary so OAI
+        // clients that always send 'instructions' still work; the engine and
+        // the CLI keep rejecting it for direct callers.
         if (!req.instructions.empty()) {
-            p.instruct = req.instructions.c_str();
+            if (base_model) {
+                static std::atomic<bool> warned{false};
+                if (!warned.exchange(true)) {
+                    fprintf(stderr, "[Server] ignoring 'instructions': base model has no instruct support\n");
+                }
+            } else {
+                p.instruct = req.instructions.c_str();
+            }
         }
 
         // Sampling overrides ride straight into the ABI, each field
