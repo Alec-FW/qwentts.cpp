@@ -14,7 +14,10 @@
 //   POST   /v1/audio/voices         register a cloned voice: {name, ref_text,
 //                                   wav_b64} extracts server side, {name,
 //                                   ref_text, spk_b64, rvq_b64} takes
-//                                   pre-extracted latents verbatim
+//                                   pre-extracted latents verbatim. Both
+//                                   forms accept the optional sampler keys
+//                                   (top_k, temperature, top_p, ...) as
+//                                   defaults for requests that omit them
 //   DELETE /v1/audio/voices/{name}  drop a registered voice
 //   GET    /health                  liveness probe
 //
@@ -42,8 +45,21 @@
 #include <thread>
 #include <vector>
 
+// Optional per-stack sampler overrides, shared by the speech request and the
+// voice registration. -1 (ints) and NaN (floats) mark a field left unset; an
+// unset request field falls back to the voice recipe, then to the engine.
+struct tts_sampler_overrides {
+    int   top_k                 = -1;  // 0 disables the top-k filter
+    float temperature           = NAN; // 0 selects greedy decoding
+    float top_p                 = NAN; // in (0, 1]
+    float repetition_penalty    = NAN; // strictly positive
+    int   subtalker_top_k       = -1;  // 0 disables the top-k filter
+    float subtalker_temperature = NAN; // 0 selects greedy decoding
+    float subtalker_top_p       = NAN; // in (0, 1]
+};
+
 // One synthesis request parsed from the OAI JSON body.
-struct tts_request {
+struct tts_request : tts_sampler_overrides {
     std::string input;         // text to speak
     std::string lang;          // language label, empty keeps the server default
     std::string voice;         // OAI voice, mapped to a speaker by the adapter
@@ -51,26 +67,17 @@ struct tts_request {
     std::string format;        // "pcm" (stream) or "wav" (one-shot)
     float       speed;         // OAI speed, parsed then ignored (no time stretch in the ABI)
 
-    // Optional sampling overrides, one set per stack. -1 (ints) and NaN
-    // (floats) mark a field the client left unset, keeping the engine
-    // defaults.
-    int64_t seed;                   // forwarded verbatim, -1 draws a random seed
-    int     max_new_tokens;         // strictly positive
-    int     top_k;                  // 0 disables the top-k filter
-    float   temperature;            // 0 selects greedy decoding
-    float   top_p;                  // in (0, 1]
-    float   repetition_penalty;     // strictly positive
-    int     subtalker_top_k;        // 0 disables the top-k filter
-    float   subtalker_temperature;  // 0 selects greedy decoding
-    float   subtalker_top_p;        // in (0, 1]
+    int64_t seed;              // forwarded verbatim, -1 draws a random seed
+    int     max_new_tokens;    // strictly positive
 };
 
 // One voice registration parsed from the POST /v1/audio/voices JSON body.
 // Exactly one payload form is present: wav holds decoded base64 WAV
 // bytes for server side extraction, or spk plus rvq hold the raw
 // contents of pre-extracted .spk and .rvq files. ref_text carries the
-// reference transcript enabling ICL clone mode when present.
-struct tts_voice_upload {
+// reference transcript enabling ICL clone mode when present. The sampler
+// fields are optional per-voice defaults for requests that leave them unset.
+struct tts_voice_upload : tts_sampler_overrides {
     std::string name;
     std::string ref_text;
     std::string wav;  // WAV file bytes
@@ -164,6 +171,50 @@ static void tts_json_error(httplib::Response & res, int status, const char * typ
     yyjson_mut_doc_free(doc);
 }
 
+// Optional well typed JSON fields with an inclusive domain. A missing key
+// leaves out untouched; a present key must match the type and range.
+static bool tts_opt_sint(yyjson_val * root, const char * key, int64_t lo, int64_t hi, int64_t & out, std::string & err) {
+    yyjson_val * v = yyjson_obj_get(root, key);
+    if (!v) {
+        return true;
+    }
+    if (!yyjson_is_int(v) || yyjson_get_sint(v) < lo || yyjson_get_sint(v) > hi) {
+        err = std::string("'") + key + "' is out of domain";
+        return false;
+    }
+    out = yyjson_get_sint(v);
+    return true;
+}
+
+static bool tts_opt_num(yyjson_val * root, const char * key, double lo, double hi, float & out, std::string & err) {
+    yyjson_val * v = yyjson_obj_get(root, key);
+    if (!v) {
+        return true;
+    }
+    if (!yyjson_is_num(v) || yyjson_get_num(v) < lo || yyjson_get_num(v) > hi) {
+        err = std::string("'") + key + "' is out of domain";
+        return false;
+    }
+    out = (float) yyjson_get_num(v);
+    return true;
+}
+
+// Parse the sampler keys shared by /v1/audio/speech and /v1/audio/voices.
+static bool tts_parse_sampler_overrides(yyjson_val * root, tts_sampler_overrides & ov, std::string & err) {
+    int64_t top_k     = -1;
+    int64_t sub_top_k = -1;
+    bool    ok = tts_opt_sint(root, "top_k", 0, INT32_MAX, top_k, err) &&
+              tts_opt_num(root, "temperature", 0.0, FLT_MAX, ov.temperature, err) &&
+              tts_opt_num(root, "top_p", DBL_MIN, 1.0, ov.top_p, err) &&
+              tts_opt_num(root, "repetition_penalty", DBL_MIN, FLT_MAX, ov.repetition_penalty, err) &&
+              tts_opt_sint(root, "subtalker_top_k", 0, INT32_MAX, sub_top_k, err) &&
+              tts_opt_num(root, "subtalker_temperature", 0.0, FLT_MAX, ov.subtalker_temperature, err) &&
+              tts_opt_num(root, "subtalker_top_p", DBL_MIN, 1.0, ov.subtalker_top_p, err);
+    ov.top_k           = (int) top_k;
+    ov.subtalker_top_k = (int) sub_top_k;
+    return ok;
+}
+
 // Parse the OAI body into req. Returns false and fills err on bad input.
 static bool tts_parse_request(const std::string & body, tts_request & req, std::string & err) {
     yyjson_doc * doc = yyjson_read(body.c_str(), body.size(), 0);
@@ -201,62 +252,22 @@ static bool tts_parse_request(const std::string & body, tts_request & req, std::
     yyjson_val * speed = yyjson_obj_get(root, "speed");
     req.speed          = yyjson_is_num(speed) ? (float) yyjson_get_num(speed) : 1.0f;
 
-    // Optional sampling overrides. A missing field keeps its unset
-    // marker; a present field must be well typed and in domain.
-    req.seed                  = -1;
-    req.max_new_tokens        = -1;
-    req.top_k                 = -1;
-    req.temperature           = NAN;
-    req.top_p                 = NAN;
-    req.repetition_penalty    = NAN;
-    req.subtalker_top_k       = -1;
-    req.subtalker_temperature = NAN;
-    req.subtalker_top_p       = NAN;
-
-    auto opt_int = [&](const char * key, int64_t lo, int64_t hi, int64_t & out) -> bool {
-        yyjson_val * v = yyjson_obj_get(root, key);
-        if (!v) {
-            return true;
-        }
-        if (!yyjson_is_int(v) || yyjson_get_sint(v) < lo || yyjson_get_sint(v) > hi) {
-            err = std::string("'") + key + "' is out of domain";
-            return false;
-        }
-        out = yyjson_get_sint(v);
-        return true;
-    };
-    auto opt_num = [&](const char * key, double lo, double hi, float & out) -> bool {
-        yyjson_val * v = yyjson_obj_get(root, key);
-        if (!v) {
-            return true;
-        }
-        if (!yyjson_is_num(v) || yyjson_get_num(v) < lo || yyjson_get_num(v) > hi) {
-            err = std::string("'") + key + "' is out of domain";
-            return false;
-        }
-        out = (float) yyjson_get_num(v);
-        return true;
-    };
-
-    int64_t max_new   = -1;
-    int64_t top_k     = -1;
-    int64_t sub_top_k = -1;
-    bool    ok = opt_int("seed", INT64_MIN, INT64_MAX, req.seed) && opt_int("max_new_tokens", 1, INT32_MAX, max_new) &&
-              opt_int("top_k", 0, INT32_MAX, top_k) && opt_num("temperature", 0.0, FLT_MAX, req.temperature) &&
-              opt_num("top_p", DBL_MIN, 1.0, req.top_p) &&
-              opt_num("repetition_penalty", DBL_MIN, FLT_MAX, req.repetition_penalty) &&
-              opt_int("subtalker_top_k", 0, INT32_MAX, sub_top_k) &&
-              opt_num("subtalker_temperature", 0.0, FLT_MAX, req.subtalker_temperature) &&
-              opt_num("subtalker_top_p", DBL_MIN, 1.0, req.subtalker_top_p);
-    req.max_new_tokens  = (int) max_new;
-    req.top_k           = (int) top_k;
-    req.subtalker_top_k = (int) sub_top_k;
+    // Optional sampler overrides plus the two request-only limits. A missing
+    // field keeps its unset marker; a present field must be well typed and
+    // in domain.
+    int64_t seed    = -1;
+    int64_t max_new = -1;
+    if (!tts_opt_sint(root, "seed", INT64_MIN, INT64_MAX, seed, err) ||
+        !tts_opt_sint(root, "max_new_tokens", 1, INT32_MAX, max_new, err) ||
+        !tts_parse_sampler_overrides(root, req, err)) {
+        yyjson_doc_free(doc);
+        return false;
+    }
+    req.seed           = seed;
+    req.max_new_tokens = (int) max_new;
 
     yyjson_doc_free(doc);
 
-    if (!ok) {
-        return false;
-    }
     if (req.format != "pcm" && req.format != "wav") {
         err = "response_format must be 'pcm' or 'wav'";
         return false;
@@ -505,6 +516,10 @@ static bool tts_parse_voice_upload(const std::string & body, tts_voice_upload & 
         (has_spk && !tts_b64_decode(yyjson_get_str(spk), up.spk)) ||
         (has_rvq && !tts_b64_decode(yyjson_get_str(rvq), up.rvq))) {
         err = "invalid base64 payload";
+        yyjson_doc_free(doc);
+        return false;
+    }
+    if (!tts_parse_sampler_overrides(root, up, err)) {
         yyjson_doc_free(doc);
         return false;
     }

@@ -24,11 +24,13 @@
 static const int RVQ_CODE_BITS = 11;
 
 // One registered cloned voice: the extraction latents in the ABI
-// ownership contract (malloc-owned, released by qt_voice_ref_free) plus
-// the reference transcript that enables ICL clone mode when present.
+// ownership contract (malloc-owned, released by qt_voice_ref_free), the
+// reference transcript that enables ICL clone mode when present, and the
+// sampler defaults used when a request leaves those fields unset.
 struct voice_entry {
-    struct qt_voice_ref ref;
-    std::string         ref_text;
+    struct qt_voice_ref   ref;
+    std::string           ref_text;
+    tts_sampler_overrides sampler;
 };
 
 // Registered voices, name keyed. Every access happens under
@@ -176,6 +178,7 @@ int main(int argc, char ** argv) {
         voice_entry entry;
         entry.ref      = {};
         entry.ref_text = up.ref_text;
+        entry.sampler  = up;
 
         if (!up.wav.empty()) {
             int     T   = 0;
@@ -266,17 +269,19 @@ int main(int argc, char ** argv) {
         // Copy the registered voice latents out under the lock: the
         // synthesis may run for seconds while another connection
         // replaces or deletes the entry.
-        std::vector<float>   voice_spk;
-        std::vector<int32_t> voice_codes;
-        std::string          voice_ref_text;
-        int                  voice_ref_T = 0;
-        bool                 have_voice  = false;
+        std::vector<float>    voice_spk;
+        std::vector<int32_t>  voice_codes;
+        std::string           voice_ref_text;
+        int                   voice_ref_T = 0;
+        bool                  have_voice  = false;
+        tts_sampler_overrides voice_sampler;
         if (!req.voice.empty()) {
             std::lock_guard<std::mutex> lock(g_voices_mutex);
             auto                        vit = g_voices.find(req.voice);
             if (vit != g_voices.end()) {
                 const voice_entry & v = vit->second;
                 have_voice            = true;
+                voice_sampler         = v.sampler;
                 voice_spk.assign(v.ref.ref_spk_emb, v.ref.ref_spk_emb + v.ref.ref_spk_dim);
                 if (!v.ref_text.empty() && v.ref.ref_codes) {
                     voice_codes.assign(v.ref.ref_codes,
@@ -314,33 +319,48 @@ int main(int argc, char ** argv) {
             }
         }
 
-        // Sampling overrides ride straight into the ABI, each field
-        // driving its own stack. A temperature of zero selects greedy
-        // decoding on that stack.
+        // Sampling overrides ride straight into the ABI, each field driving
+        // its own stack. A request field wins over the voice recipe and the
+        // engine default fills whatever neither sets. A temperature of zero
+        // selects greedy decoding on that stack.
         p.seed = req.seed;
         if (req.max_new_tokens != -1) {
             p.max_new_tokens = req.max_new_tokens;
         }
         if (req.top_k != -1) {
             p.top_k = req.top_k;
+        } else if (voice_sampler.top_k != -1) {
+            p.top_k = voice_sampler.top_k;
         }
         if (!std::isnan(req.temperature)) {
             p.temperature = req.temperature;
+        } else if (!std::isnan(voice_sampler.temperature)) {
+            p.temperature = voice_sampler.temperature;
         }
         if (!std::isnan(req.top_p)) {
             p.top_p = req.top_p;
+        } else if (!std::isnan(voice_sampler.top_p)) {
+            p.top_p = voice_sampler.top_p;
         }
         if (req.subtalker_top_k != -1) {
             p.subtalker_top_k = req.subtalker_top_k;
+        } else if (voice_sampler.subtalker_top_k != -1) {
+            p.subtalker_top_k = voice_sampler.subtalker_top_k;
         }
         if (!std::isnan(req.subtalker_temperature)) {
             p.subtalker_temperature = req.subtalker_temperature;
+        } else if (!std::isnan(voice_sampler.subtalker_temperature)) {
+            p.subtalker_temperature = voice_sampler.subtalker_temperature;
         }
         if (!std::isnan(req.subtalker_top_p)) {
             p.subtalker_top_p = req.subtalker_top_p;
+        } else if (!std::isnan(voice_sampler.subtalker_top_p)) {
+            p.subtalker_top_p = voice_sampler.subtalker_top_p;
         }
         if (!std::isnan(req.repetition_penalty)) {
             p.repetition_penalty = req.repetition_penalty;
+        } else if (!std::isnan(voice_sampler.repetition_penalty)) {
+            p.repetition_penalty = voice_sampler.repetition_penalty;
         }
 
         // Trampoline : the C ABI on_chunk forwards to the C++ sink.
